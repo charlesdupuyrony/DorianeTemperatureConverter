@@ -1,0 +1,512 @@
+data <- read.csv(paste(path, parent, "ragtdata.csv", sep=""), header = TRUE, sep=";")
+phenoLimiter <- ncol(data)-numberOfPostions
+deno <- dim(data)[1]
+geno = data[, (phenoLimiter+1):ncol(data)]
+geno <- data.frame(lapply(geno, function(x){gsub("/", "", x)}))
+rownames(geno) <- data[, 1]
+snp <- raw.data(data = as.matrix(geno), frame="wide", base=TRUE, sweep.sample=0.5, call.rate=0.95, maf=0.1, imput=FALSE)
+markers <- snp$M.clean
+MS = scale(markers)
+gmx = MS%*%t(MS)/ncol(MS)
+pheno <- data[, 1:phenoLimiter] %>% dplyr::select(-c(PARENT1, FAB))
+pheno$ID <- as.factor(pheno$ID)
+rownames(pheno) <- data[, 1]
+sed <- 123456
+set.seed(sed)
+parent <- c(parent)
+deno <- c(deno)
+y.trn <- pheno
+vv <- sample(rownames(pheno), round(nrow(pheno)/5))
+y.trn[vv, "RDT"] <- NA
+# rrBLUP initial
+rrblup <- mmer(RDT~1, random=~vsr(list(gmx), buildGu = FALSE), rcov=~units, getPEV = FALSE, nIters=3, data=y.trn, verbose=FALSE)
+u <- gmx %*% as.matrix(rrblup$U$`u:gmx`$RDT)
+acc <- cor(u[vv,], pheno[vv, "RDT"])
+rme <- rmse(u[vv,], pheno[vv, "RDT"])
+case <- c("rrblup initial")
+accuracy <- c(acc)
+error <- c(rme)
+outlier <- c(0)
+runtime <- c(0)
+# Identify and remove outliers within phenotyping training set (80% of the set)
+sub <- y.trn[which(!is.na(y.trn$RDT)), ]
+ans <- sub %>% dplyr::select(c(ID, RDT))
+sub <- sub %>% dplyr::select(-c(ID))
+sub$RDT <- scale(sub$RDT)
+# Mahalanobis distance and multivariate anomaly detection
+# p value has to be less than 0.001
+run.time <- proc.time()
+ans$mah <- mahalanobis(sub, colMeans(sub), cov(sub))
+ans$mahpvalue <- pchisq(ans$mah, df=ncol(sub)-1, lower.tail=FALSE)
+runtime <- c(runtime, (proc.time()-run.time)[3])
+ans$mahOutlier <- ans$mahpvalue <= 0.001
+ans <- ans %>% dplyr::select(-c(mah, mahpvalue))
+# remove outliers identified through Mahalanobis and recompute the markers
+ii <- rownames(ans[!ans$mahOutlier, ])
+iy.trn <- rbind(y.trn[ii, ], y.trn[which(is.na(y.trn$RDT)), ])
+iy.trn <- iy.trn[order(rownames(iy.trn)), ]
+igeno <- geno[rownames(iy.trn), ]
+isnp <- raw.data(data = as.matrix(igeno), frame="wide", base=TRUE, sweep.sample=0.5, call.rate=0.95, maf=0.1, imput=FALSE)
+markers <- isnp$M.clean
+MS = scale(markers)
+igmx = MS%*%t(MS)/ncol(MS)
+# rrBLUP Mahalanobis
+rrblup <- mmer(RDT~1, random=~vsr(list(igmx), buildGu = FALSE), rcov=~units, getPEV = FALSE, nIters=3, data=iy.trn, verbose=FALSE)
+u <- igmx %*% as.matrix(rrblup$U$`u:igmx`$RDT)
+acc <- cor(u[vv,], pheno[vv, "RDT"])
+rme <- rmse(u[vv,], pheno[vv, "RDT"])
+case <- c(case, "rrblup mahalanobis")
+accuracy <- c(accuracy, acc)
+error <- c(error, rme)
+outlier <- c(outlier, dim(ans[ans$mahOutlier, ])[1])
+# Cook distance: an estimation of the influence of data point. It takes into account both the leverage and residual of each observation
+# General rule: investigate any point that is more than 3x the mean of all the distances
+run.time <- proc.time()
+md <- lm(RDT ~ ., data=sub)
+ans$cooks <- cooks.distance(md)
+ans$cooksOutlier <- ans$cooks > (3 * mean(ans$cooks, na.rm=TRUE))
+runtime <- c(runtime, (proc.time()-run.time)[3])
+ans <- ans %>% dplyr::select(-c(cooks))
+# remove outliers identified through Cooks distance and recompute the markers
+ii <- rownames(ans[!ans$cooksOutlier, ])
+iy.trn <- rbind(y.trn[ii, ], y.trn[which(is.na(y.trn$RDT)), ])
+iy.trn <- iy.trn[order(rownames(iy.trn)), ]
+igeno <- geno[rownames(iy.trn), ]
+isnp <- raw.data(data = as.matrix(igeno), frame="wide", base=TRUE, sweep.sample=0.5, call.rate=0.95, maf=0.1, imput=FALSE)
+markers <- isnp$M.clean
+MS = scale(markers)
+igmx = MS%*%t(MS)/ncol(MS)
+# rrBLUP Cooks
+rrblup <- mmer(RDT~1, random=~vsr(list(igmx), buildGu = FALSE), rcov=~units, getPEV = FALSE, nIters=3, data=iy.trn, verbose=FALSE)
+u <- igmx %*% as.matrix(rrblup$U$`u:igmx`$RDT)
+acc <- cor(u[vv,], pheno[vv, "RDT"])
+rme <- rmse(u[vv,], pheno[vv, "RDT"])
+case <- c(case, "rrblup cooks")
+accuracy <- c(accuracy, acc)
+error <- c(error, rme)
+outlier <- c(outlier, dim(ans[ans$cooksOutlier, ])[1])
+# One-class support vector machine anomaly detection
+# nu: An upper bound on the fraction of margin errors - default: 0,5
+run.time <- proc.time()
+ocsvm <- svm(sub, nu=0.09, type="one-classification")
+pred <- predict(ocsvm)
+ans$ocsvmOutlier <- !pred
+runtime <- c(runtime, (proc.time()-run.time)[3])
+# remove outliers identified through one-class support vector machine and recompute the markers
+ii <- rownames(ans[!ans$ocsvmOutlier, ])
+iy.trn <- rbind(y.trn[ii, ], y.trn[which(is.na(y.trn$RDT)), ])
+iy.trn <- iy.trn[order(rownames(iy.trn)), ]
+igeno <- geno[rownames(iy.trn), ]
+isnp <- raw.data(data = as.matrix(igeno), frame="wide", base=TRUE, sweep.sample=0.5, call.rate=0.95, maf=0.1, imput=FALSE)
+markers <- isnp$M.clean
+MS = scale(markers)
+igmx = MS%*%t(MS)/ncol(MS)
+# rrBLUP OC-SVM
+rrblup <- mmer(RDT~1, random=~vsr(list(igmx), buildGu = FALSE), rcov=~units, getPEV = FALSE, nIters=3, data=iy.trn, verbose=FALSE)
+u <- igmx %*% as.matrix(rrblup$U$`u:igmx`$RDT)
+acc <- cor(u[vv,], pheno[vv, "RDT"])
+rme <- rmse(u[vv,], pheno[vv, "RDT"])
+case <- c(case, "rrblup oc-svm")
+accuracy <- c(accuracy, acc)
+error <- c(error, rme)
+outlier <- c(outlier, dim(ans[ans$ocsvmOutlier, ])[1])
+# K-Means clustering outlier detection method
+# Nb clusters: 2 - the cluster with the less samples is outliers
+# We'll extract top outliers number by collecting two extreme (min and max) values of distance.
+run.time <- proc.time()
+km = kmeans(sub, centers=2)
+oc <- if(table(km$cluster)[1] == min(table(km$cluster))) 1 else 2
+ans$kmeansOutlier <- km$cluster==oc
+runtime <- c(runtime, (proc.time()-run.time)[3])
+# remove outliers identified through one-class support vector machine and recompute the markers
+ii <- rownames(ans[!ans$kmeansOutlier, ])
+iy.trn <- rbind(y.trn[ii, ], y.trn[which(is.na(y.trn$RDT)), ])
+iy.trn <- iy.trn[order(rownames(iy.trn)), ]
+igeno <- geno[rownames(iy.trn), ]
+isnp <- raw.data(data = as.matrix(igeno), frame="wide", base=TRUE, sweep.sample=0.5, call.rate=0.95, maf=0.1, imput=FALSE)
+markers <- isnp$M.clean
+MS = scale(markers)
+igmx = MS%*%t(MS)/ncol(MS)
+# rrBLUP k-means clustering
+rrblup <- mmer(RDT~1, random=~vsr(list(igmx), buildGu = FALSE), rcov=~units, getPEV = FALSE, nIters=3, data=iy.trn, verbose=FALSE)
+u <- igmx %*% as.matrix(rrblup$U$`u:igmx`$RDT)
+acc <- cor(u[vv,], pheno[vv, "RDT"])
+rme <- rmse(u[vv,], pheno[vv, "RDT"])
+case <- c(case, "rrblup kmeans")
+accuracy <- c(accuracy, acc)
+error <- c(error, rme)
+outlier <- c(outlier, dim(ans[ans$kmeansOutlier, ])[1])
+# create isolation forest using isolationForest function from solitude package with default parameters
+# anomaly score: >0.6
+score <- 0.6
+run.time <- proc.time()
+iso <- isolationForest$new(sample_size=nrow(sub), num_trees=round(nrow(sub)/3), seed=sed)
+iso$fit(sub)
+pred <- iso$predict(sub)
+ans$iForestOutlier <- pred$anomaly_score>=score
+runtime <- c(runtime, (proc.time()-run.time)[3])
+# remove outliers identified through isolation forest and recompute the markers
+ii <- rownames(ans[!ans$iForestOutlier, ])
+iy.trn <- rbind(y.trn[ii, ], y.trn[which(is.na(y.trn$RDT)), ])
+iy.trn <- iy.trn[order(rownames(iy.trn)), ]
+igeno <- geno[rownames(iy.trn), ]
+isnp <- raw.data(data = as.matrix(igeno), frame="wide", base=TRUE, sweep.sample=0.5, call.rate=0.95, maf=0.1, imput=FALSE)
+markers <- isnp$M.clean
+MS = scale(markers)
+igmx = MS%*%t(MS)/ncol(MS)
+# rrBLUP isolation forest clustering
+rrblup <- mmer(RDT~1, random=~vsr(list(igmx), buildGu = FALSE), rcov=~units, getPEV = FALSE, nIters=3, data=iy.trn, verbose=FALSE)
+u <- igmx %*% as.matrix(rrblup$U$`u:igmx`$RDT)
+acc <- cor(u[vv,], pheno[vv, "RDT"])
+rme <- rmse(u[vv,], pheno[vv, "RDT"])
+case <- c(case, "rrblup iforest")
+accuracy <- c(accuracy, acc)
+error <- c(error, rme)
+outlier <- c(outlier, dim(ans[ans$iForestOutlier, ])[1])
+# Fitting DBScan clustering Model
+# Epsilon (ε) is the minimum distance between two data points
+# MinPts: determining the minimum number of objects to create a cluster
+# cluster 0 contains all the noises: cluster == 0
+run.time <- proc.time()
+dbsc <- dbscan(sub, eps = 1, MinPts = 2)
+ans$dbscanOutlier <- dbsc$cluster==0
+runtime <- c(runtime, (proc.time()-run.time)[3])
+# remove outliers identified through dbscan clustering
+ii <- rownames(ans[!ans$dbscanOutlier, ])
+iy.trn <- rbind(y.trn[ii, ], y.trn[which(is.na(y.trn$RDT)), ])
+iy.trn <- iy.trn[order(rownames(iy.trn)), ]
+igeno <- geno[rownames(iy.trn), ]
+isnp <- raw.data(data = as.matrix(igeno), frame="wide", base=TRUE, sweep.sample=0.5, call.rate=0.95, maf=0.1, imput=FALSE)
+markers <- isnp$M.clean
+MS = scale(markers)
+igmx = MS%*%t(MS)/ncol(MS)
+# rrBLUP dbscan clustering
+rrblup <- mmer(RDT~1, random=~vsr(list(igmx), buildGu = FALSE), rcov=~units, getPEV = FALSE, nIters=3, data=iy.trn, verbose=FALSE)
+u <- igmx %*% as.matrix(rrblup$U$`u:igmx`$RDT)
+acc <- cor(u[vv,], pheno[vv, "RDT"])
+rme <- rmse(u[vv,], pheno[vv, "RDT"])
+case <- c(case, "rrblup dbscan")
+accuracy <- c(accuracy, acc)
+error <- c(error, rme)
+outlier <- c(outlier, dim(ans[ans$dbscanOutlier, ])[1])
+# Gaussian Mixte model
+# Number of clusters: 2
+run.time <- proc.time()
+gmm = Mclust(sub, 2)
+oc <- if(table(gmm$classification)[1] == min(table(gmm$classification))) 1 else 2
+ans$gaussianOutlier <- gmm$classification==oc
+runtime <- c(runtime, (proc.time()-run.time)[3])
+# remove outliers identified through gaussian mixte clustering
+ii <- rownames(ans[!ans$gaussianOutlier, ])
+iy.trn <- rbind(y.trn[ii, ], y.trn[which(is.na(y.trn$RDT)), ])
+iy.trn <- iy.trn[order(rownames(iy.trn)), ]
+igeno <- geno[rownames(iy.trn), ]
+isnp <- raw.data(data = as.matrix(igeno), frame="wide", base=TRUE, sweep.sample=0.5, call.rate=0.95, maf=0.1, imput=FALSE)
+markers <- isnp$M.clean
+MS = scale(markers)
+igmx = MS%*%t(MS)/ncol(MS)
+# rrBLUP gaussian clustering
+rrblup <- mmer(RDT~1, random=~vsr(list(igmx), buildGu = FALSE), rcov=~units, getPEV = FALSE, nIters=3, data=iy.trn, verbose=FALSE)
+u <- igmx %*% as.matrix(rrblup$U$`u:igmx`$RDT)
+acc <- cor(u[vv,], pheno[vv, "RDT"])
+rme <- rmse(u[vv,], pheno[vv, "RDT"])
+case <- c(case, "rrblup dbscan")
+accuracy <- c(accuracy, acc)
+error <- c(error, rme)
+outlier <- c(outlier, dim(ans[ans$gaussianOutlier, ])[1])
+if (dim(results)[1] > 0){
+results <- rbind(results, data.frame(case, accuracy, error, parent, deno, outlier, runtime))
+} else {
+results <- data.frame(case, accuracy, error, parent, deno, outlier, runtime)
+}
+}
+write.table(results, file=paste(path, "results.csv", sep=""), sep=";")
+test <- read.csv(paste(path, "results.csv", sep=""), header = TRUE, sep=";")
+print(test)
+rm(list=ls())
+library(snpReady)
+library(dplyr)
+library(sommer)
+library(Metrics)
+library(e1071)
+library(solitude)
+library(fpc)
+library(mclust)
+path <- "/home/rony/workspace/thesis/outlier/data/"
+# testers <- c(36176, 37138, 693605, 1228259, 1227976, 869227, 1398332, 534471, 959587, 3433, 282874)
+testers <- c(36176)
+numberOfPostions <- 14889
+results <- data.frame()
+for (t in testers){
+parent <- t
+data <- read.csv(paste(path, parent, "ragtdata.csv", sep=""), header = TRUE, sep=";")
+phenoLimiter <- ncol(data)-numberOfPostions
+deno <- dim(data)[1]
+geno = data[, (phenoLimiter+1):ncol(data)]
+geno <- data.frame(lapply(geno, function(x){gsub("/", "", x)}))
+rownames(geno) <- data[, 1]
+snp <- raw.data(data = as.matrix(geno), frame="wide", base=TRUE, sweep.sample=0.5, call.rate=0.95, maf=0.1, imput=FALSE)
+markers <- snp$M.clean
+MS = scale(markers)
+gmx = MS%*%t(MS)/ncol(MS)
+pheno <- data[, 1:phenoLimiter] %>% dplyr::select(-c(PARENT1, FAB))
+pheno$ID <- as.factor(pheno$ID)
+rownames(pheno) <- data[, 1]
+sed <- 123456
+set.seed(sed)
+parent <- c(parent)
+deno <- c(deno)
+y.trn <- pheno
+vv <- sample(rownames(pheno), round(nrow(pheno)/5))
+y.trn[vv, "RDT"] <- NA
+# rrBLUP initial
+rrblup <- mmer(RDT~1, random=~vsr(list(gmx), buildGu = FALSE), rcov=~units, getPEV = FALSE, nIters=3, data=y.trn, verbose=FALSE)
+u <- gmx %*% as.matrix(rrblup$U$`u:gmx`$RDT)
+acc <- cor(u[vv,], pheno[vv, "RDT"])
+rme <- rmse(u[vv,], pheno[vv, "RDT"])
+case <- c("rrblup initial")
+accuracy <- c(acc)
+error <- c(rme)
+outlier <- c(0)
+runtime <- c(0)
+# Identify and remove outliers within phenotyping training set (80% of the set)
+sub <- y.trn[which(!is.na(y.trn$RDT)), ]
+ans <- sub %>% dplyr::select(c(ID, RDT))
+sub <- sub %>% dplyr::select(-c(ID))
+sub$RDT <- scale(sub$RDT)
+# Mahalanobis distance and multivariate anomaly detection
+# p value has to be less than 0.001
+run.time <- proc.time()
+ans$mah <- mahalanobis(sub, colMeans(sub), cov(sub))
+ans$mahpvalue <- pchisq(ans$mah, df=ncol(sub)-1, lower.tail=FALSE)
+runtime <- c(runtime, (proc.time()-run.time)[3])
+ans$mahOutlier <- ans$mahpvalue <= 0.001
+ans <- ans %>% dplyr::select(-c(mah, mahpvalue))
+# remove outliers identified through Mahalanobis and recompute the markers
+ii <- rownames(ans[!ans$mahOutlier, ])
+iy.trn <- rbind(y.trn[ii, ], y.trn[which(is.na(y.trn$RDT)), ])
+iy.trn <- iy.trn[order(rownames(iy.trn)), ]
+igeno <- geno[rownames(iy.trn), ]
+isnp <- raw.data(data = as.matrix(igeno), frame="wide", base=TRUE, sweep.sample=0.5, call.rate=0.95, maf=0.1, imput=FALSE)
+markers <- isnp$M.clean
+MS = scale(markers)
+igmx = MS%*%t(MS)/ncol(MS)
+# rrBLUP Mahalanobis
+rrblup <- mmer(RDT~1, random=~vsr(list(igmx), buildGu = FALSE), rcov=~units, getPEV = FALSE, nIters=3, data=iy.trn, verbose=FALSE)
+u <- igmx %*% as.matrix(rrblup$U$`u:igmx`$RDT)
+acc <- cor(u[vv,], pheno[vv, "RDT"])
+rme <- rmse(u[vv,], pheno[vv, "RDT"])
+case <- c(case, "rrblup mahalanobis")
+accuracy <- c(accuracy, acc)
+error <- c(error, rme)
+outlier <- c(outlier, dim(ans[ans$mahOutlier, ])[1])
+# Cook distance: an estimation of the influence of data point. It takes into account both the leverage and residual of each observation
+# General rule: investigate any point that is more than 3x the mean of all the distances
+run.time <- proc.time()
+md <- lm(RDT ~ ., data=sub)
+ans$cooks <- cooks.distance(md)
+ans$cooksOutlier <- ans$cooks > (3 * mean(ans$cooks, na.rm=TRUE))
+runtime <- c(runtime, (proc.time()-run.time)[3])
+ans <- ans %>% dplyr::select(-c(cooks))
+# remove outliers identified through Cooks distance and recompute the markers
+ii <- rownames(ans[!ans$cooksOutlier, ])
+iy.trn <- rbind(y.trn[ii, ], y.trn[which(is.na(y.trn$RDT)), ])
+iy.trn <- iy.trn[order(rownames(iy.trn)), ]
+igeno <- geno[rownames(iy.trn), ]
+isnp <- raw.data(data = as.matrix(igeno), frame="wide", base=TRUE, sweep.sample=0.5, call.rate=0.95, maf=0.1, imput=FALSE)
+markers <- isnp$M.clean
+MS = scale(markers)
+igmx = MS%*%t(MS)/ncol(MS)
+# rrBLUP Cooks
+rrblup <- mmer(RDT~1, random=~vsr(list(igmx), buildGu = FALSE), rcov=~units, getPEV = FALSE, nIters=3, data=iy.trn, verbose=FALSE)
+u <- igmx %*% as.matrix(rrblup$U$`u:igmx`$RDT)
+acc <- cor(u[vv,], pheno[vv, "RDT"])
+rme <- rmse(u[vv,], pheno[vv, "RDT"])
+case <- c(case, "rrblup cooks")
+accuracy <- c(accuracy, acc)
+error <- c(error, rme)
+outlier <- c(outlier, dim(ans[ans$cooksOutlier, ])[1])
+# One-class support vector machine anomaly detection
+# nu: An upper bound on the fraction of margin errors - default: 0,5
+run.time <- proc.time()
+ocsvm <- svm(sub, nu=0.09, type="one-classification")
+pred <- predict(ocsvm)
+ans$ocsvmOutlier <- !pred
+runtime <- c(runtime, (proc.time()-run.time)[3])
+# remove outliers identified through one-class support vector machine and recompute the markers
+ii <- rownames(ans[!ans$ocsvmOutlier, ])
+iy.trn <- rbind(y.trn[ii, ], y.trn[which(is.na(y.trn$RDT)), ])
+iy.trn <- iy.trn[order(rownames(iy.trn)), ]
+igeno <- geno[rownames(iy.trn), ]
+isnp <- raw.data(data = as.matrix(igeno), frame="wide", base=TRUE, sweep.sample=0.5, call.rate=0.95, maf=0.1, imput=FALSE)
+markers <- isnp$M.clean
+MS = scale(markers)
+igmx = MS%*%t(MS)/ncol(MS)
+# rrBLUP OC-SVM
+rrblup <- mmer(RDT~1, random=~vsr(list(igmx), buildGu = FALSE), rcov=~units, getPEV = FALSE, nIters=3, data=iy.trn, verbose=FALSE)
+u <- igmx %*% as.matrix(rrblup$U$`u:igmx`$RDT)
+acc <- cor(u[vv,], pheno[vv, "RDT"])
+rme <- rmse(u[vv,], pheno[vv, "RDT"])
+case <- c(case, "rrblup oc-svm")
+accuracy <- c(accuracy, acc)
+error <- c(error, rme)
+outlier <- c(outlier, dim(ans[ans$ocsvmOutlier, ])[1])
+# K-Means clustering outlier detection method
+# Nb clusters: 2 - the cluster with the less samples is outliers
+# We'll extract top outliers number by collecting two extreme (min and max) values of distance.
+run.time <- proc.time()
+km = kmeans(sub, centers=2)
+oc <- if(table(km$cluster)[1] == min(table(km$cluster))) 1 else 2
+ans$kmeansOutlier <- km$cluster==oc
+runtime <- c(runtime, (proc.time()-run.time)[3])
+# remove outliers identified through one-class support vector machine and recompute the markers
+ii <- rownames(ans[!ans$kmeansOutlier, ])
+iy.trn <- rbind(y.trn[ii, ], y.trn[which(is.na(y.trn$RDT)), ])
+iy.trn <- iy.trn[order(rownames(iy.trn)), ]
+igeno <- geno[rownames(iy.trn), ]
+isnp <- raw.data(data = as.matrix(igeno), frame="wide", base=TRUE, sweep.sample=0.5, call.rate=0.95, maf=0.1, imput=FALSE)
+markers <- isnp$M.clean
+MS = scale(markers)
+igmx = MS%*%t(MS)/ncol(MS)
+# rrBLUP k-means clustering
+rrblup <- mmer(RDT~1, random=~vsr(list(igmx), buildGu = FALSE), rcov=~units, getPEV = FALSE, nIters=3, data=iy.trn, verbose=FALSE)
+u <- igmx %*% as.matrix(rrblup$U$`u:igmx`$RDT)
+acc <- cor(u[vv,], pheno[vv, "RDT"])
+rme <- rmse(u[vv,], pheno[vv, "RDT"])
+case <- c(case, "rrblup kmeans")
+accuracy <- c(accuracy, acc)
+error <- c(error, rme)
+outlier <- c(outlier, dim(ans[ans$kmeansOutlier, ])[1])
+# create isolation forest using isolationForest function from solitude package with default parameters
+# anomaly score: >0.6
+score <- 0.6
+run.time <- proc.time()
+iso <- isolationForest$new(sample_size=nrow(sub), num_trees=round(nrow(sub)/3), seed=sed)
+iso$fit(sub)
+pred <- iso$predict(sub)
+ans$iForestOutlier <- pred$anomaly_score>=score
+runtime <- c(runtime, (proc.time()-run.time)[3])
+# remove outliers identified through isolation forest and recompute the markers
+ii <- rownames(ans[!ans$iForestOutlier, ])
+iy.trn <- rbind(y.trn[ii, ], y.trn[which(is.na(y.trn$RDT)), ])
+iy.trn <- iy.trn[order(rownames(iy.trn)), ]
+igeno <- geno[rownames(iy.trn), ]
+isnp <- raw.data(data = as.matrix(igeno), frame="wide", base=TRUE, sweep.sample=0.5, call.rate=0.95, maf=0.1, imput=FALSE)
+markers <- isnp$M.clean
+MS = scale(markers)
+igmx = MS%*%t(MS)/ncol(MS)
+# rrBLUP isolation forest clustering
+rrblup <- mmer(RDT~1, random=~vsr(list(igmx), buildGu = FALSE), rcov=~units, getPEV = FALSE, nIters=3, data=iy.trn, verbose=FALSE)
+u <- igmx %*% as.matrix(rrblup$U$`u:igmx`$RDT)
+acc <- cor(u[vv,], pheno[vv, "RDT"])
+rme <- rmse(u[vv,], pheno[vv, "RDT"])
+case <- c(case, "rrblup iforest")
+accuracy <- c(accuracy, acc)
+error <- c(error, rme)
+outlier <- c(outlier, dim(ans[ans$iForestOutlier, ])[1])
+# Fitting DBScan clustering Model
+# Epsilon (ε) is the minimum distance between two data points
+# MinPts: determining the minimum number of objects to create a cluster
+# cluster 0 contains all the noises: cluster == 0
+run.time <- proc.time()
+dbsc <- dbscan(sub, eps = 1, MinPts = 2)
+ans$dbscanOutlier <- dbsc$cluster==0
+runtime <- c(runtime, (proc.time()-run.time)[3])
+# remove outliers identified through dbscan clustering
+ii <- rownames(ans[!ans$dbscanOutlier, ])
+iy.trn <- rbind(y.trn[ii, ], y.trn[which(is.na(y.trn$RDT)), ])
+iy.trn <- iy.trn[order(rownames(iy.trn)), ]
+igeno <- geno[rownames(iy.trn), ]
+isnp <- raw.data(data = as.matrix(igeno), frame="wide", base=TRUE, sweep.sample=0.5, call.rate=0.95, maf=0.1, imput=FALSE)
+markers <- isnp$M.clean
+MS = scale(markers)
+igmx = MS%*%t(MS)/ncol(MS)
+# rrBLUP dbscan clustering
+rrblup <- mmer(RDT~1, random=~vsr(list(igmx), buildGu = FALSE), rcov=~units, getPEV = FALSE, nIters=3, data=iy.trn, verbose=FALSE)
+u <- igmx %*% as.matrix(rrblup$U$`u:igmx`$RDT)
+acc <- cor(u[vv,], pheno[vv, "RDT"])
+rme <- rmse(u[vv,], pheno[vv, "RDT"])
+case <- c(case, "rrblup dbscan")
+accuracy <- c(accuracy, acc)
+error <- c(error, rme)
+outlier <- c(outlier, dim(ans[ans$dbscanOutlier, ])[1])
+# Gaussian Mixte model
+# Number of clusters: 2
+run.time <- proc.time()
+gmm = Mclust(sub, 2)
+oc <- if(table(gmm$classification)[1] == min(table(gmm$classification))) 1 else 2
+ans$gaussianOutlier <- gmm$classification==oc
+runtime <- c(runtime, (proc.time()-run.time)[3])
+# remove outliers identified through gaussian mixte clustering
+ii <- rownames(ans[!ans$gaussianOutlier, ])
+iy.trn <- rbind(y.trn[ii, ], y.trn[which(is.na(y.trn$RDT)), ])
+iy.trn <- iy.trn[order(rownames(iy.trn)), ]
+igeno <- geno[rownames(iy.trn), ]
+isnp <- raw.data(data = as.matrix(igeno), frame="wide", base=TRUE, sweep.sample=0.5, call.rate=0.95, maf=0.1, imput=FALSE)
+markers <- isnp$M.clean
+MS = scale(markers)
+igmx = MS%*%t(MS)/ncol(MS)
+# rrBLUP gaussian clustering
+rrblup <- mmer(RDT~1, random=~vsr(list(igmx), buildGu = FALSE), rcov=~units, getPEV = FALSE, nIters=3, data=iy.trn, verbose=FALSE)
+u <- igmx %*% as.matrix(rrblup$U$`u:igmx`$RDT)
+acc <- cor(u[vv,], pheno[vv, "RDT"])
+rme <- rmse(u[vv,], pheno[vv, "RDT"])
+case <- c(case, "rrblup gaussian")
+accuracy <- c(accuracy, acc)
+error <- c(error, rme)
+outlier <- c(outlier, dim(ans[ans$gaussianOutlier, ])[1])
+if (dim(results)[1] > 0){
+results <- rbind(results, data.frame(case, accuracy, error, parent, deno, outlier, runtime))
+} else {
+results <- data.frame(case, accuracy, error, parent, deno, outlier, runtime)
+}
+}
+write.table(results, file=paste(path, "results.csv", sep=""), sep=";")
+test <- read.csv(paste(path, "results.csv", sep=""), header = TRUE, sep=";")
+print(test)
+gmm$G
+gmm$modelName
+head(gmm$z)
+plot(gmm, what=c("classification"))
+install.packages("roxygen2")
+source("~/workspace/thesis/outlier/Doriane/temperature_conversion.R")
+source("~/workspace/thesis/outlier/Doriane/temperature_conversion.R")
+source("~/workspace/thesis/outlier/Doriane/temperature_conversion.R")
+source("~/workspace/thesis/outlier/Doriane/temperature_conversion.R")
+source("~/workspace/thesis/outlier/Doriane/temperature_conversion.R")
+source("~/workspace/thesis/outlier/Doriane/temperature_conversion.R")
+source("~/workspace/thesis/outlier/Doriane/temperature_conversion.R")
+source("~/workspace/thesis/outlier/Doriane/temperature_conversion.R")
+Fahrenheit_to_Celsius <- function(fahrenheit){
+celcius <- (fahrenheit - 32) * 5/9;
+return (celcius)
+}
+Celsius_to_Fahrenheit <- function(celcius){
+fahrenheit <- (celcius * 9/5) + 32;
+return (fahrenheit)
+}
+Fahrenheit_to_Celsius <- function(fahrenheit){
+celcius <- (fahrenheit - 32) * 5/9;
+return (celcius)
+}
+Celsius_to_Fahrenheit <- function(celcius){
+fahrenheit <- (celcius * 9/5) + 32;
+return (fahrenheit)
+}
+source("~/workspace/thesis/outlier/Doriane/temperature_conversion.R")
+Fahrenheit_to_Celsius <- function(fahrenheit){
+celcius <- (fahrenheit - 32) * 5/9;
+return (celcius)
+}
+Celsius_to_Fahrenheit <- function(celcius){
+fahrenheit <- (celcius * 9/5) + 32;
+return (fahrenheit)
+}
+library(devtools)
+setwd("/home/rony/workspace/thesis/outlier/Doriane/")
+load_all(">")
+load_all(".")
+Fahrenheit_to_Celsius(79)
+Celsius_to_Fahrenheit(30)
+Celsius_to_Fahrenheit(32)
+Fahrenheit_to_Celsius(32)
